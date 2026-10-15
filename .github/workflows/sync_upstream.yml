@@ -1,0 +1,67 @@
+name: Sync Upstream Release & Deploy
+
+on:
+  schedule:
+    # 每天 UTC 00:00 (北京时间 08:00) 定期检查上游 Release
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # 如需通过 push 直接触发其他 workflow，也可在仓库 Secrets 中配置 PAT_TOKEN
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Check upstream latest release and sync
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 添加上游仓库并拉取最新分支与标签
+          git remote add upstream https://github.com/Zephyruso/zashboard.git || true
+          git fetch upstream --tags --force
+
+          # 获取上游最新 Release 标签
+          LATEST_TAG=$(gh api repos/Zephyruso/zashboard/releases/latest --jq '.tag_name')
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "未获取到上游 Release 信息"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          UPSTREAM_COMMIT=$(git rev-list -n 1 "refs/tags/${LATEST_TAG}")
+          echo "上游最新 Release: ${LATEST_TAG} (${UPSTREAM_COMMIT})"
+
+          # 检查当前分支是否已包含该 Release 的 commit
+          if git merge-base --is-ancestor "${UPSTREAM_COMMIT}" HEAD; then
+            echo "当前仓库已包含上游最新 Release (${LATEST_TAG})，无需同步。"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "发现上游新 Release (${LATEST_TAG})，开始同步 commit..."
+            git merge "${UPSTREAM_COMMIT}" --no-edit -m "chore: sync upstream release ${LATEST_TAG}"
+            git push origin main
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger custom_deploy workflow
+        if: steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "正在触发 custom_deploy.yml (Release: ${{ steps.sync.outputs.release_tag }})..."
+          gh workflow run custom_deploy.yml --ref main
